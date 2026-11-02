@@ -431,6 +431,8 @@ pub enum PipelineCacheError {
     ShaderImportNotYetAvailable,
     #[error("Could not create shader module: {0}")]
     CreateShaderModule(String),
+    #[error("Could not create render pipeline: {0}")]
+    CreateRenderPipeline(String),
 }
 
 // TODO: This needs to be kept up to date with the capabilities in the `create_validator` function in wgpu-core

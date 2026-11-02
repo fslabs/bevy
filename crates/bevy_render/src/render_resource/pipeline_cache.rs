@@ -381,18 +381,29 @@ impl PipelineCache {
     }
 
     /// Wait for a render pipeline to finish compiling.
+    ///
+    /// Browser WebGPU compilation needs the JavaScript event loop. On that backend this
+    /// processes completed tasks and returns; callers must skip pipelines that are still pending.
     #[inline]
     pub fn block_on_render_pipeline(&mut self, id: CachedRenderPipelineId) {
-        if self.pipelines.len() <= id.0 {
+        #[cfg(all(target_arch = "wasm32", feature = "webgpu"))]
+        {
+            let _ = id;
             self.process_queue();
         }
+        #[cfg(not(all(target_arch = "wasm32", feature = "webgpu")))]
+        {
+            if self.pipelines.len() <= id.0 {
+                self.process_queue();
+            }
 
-        let state = &mut self.pipelines[id.0].state;
-        if let CachedPipelineState::Creating(task) = state {
-            *state = match bevy_tasks::block_on(task) {
-                Ok(p) => CachedPipelineState::Ok(p),
-                Err(e) => CachedPipelineState::Err(e),
-            };
+            let state = &mut self.pipelines[id.0].state;
+            if let CachedPipelineState::Creating(task) = state {
+                *state = match bevy_tasks::block_on(task) {
+                    Ok(p) => CachedPipelineState::Ok(p),
+                    Err(e) => CachedPipelineState::Err(e),
+                };
+            }
         }
     }
 
@@ -613,9 +624,14 @@ impl PipelineCache {
                     cache: None,
                 };
 
-                Ok(Pipeline::RenderPipeline(
-                    device.create_render_pipeline(&descriptor),
-                ))
+                #[cfg(all(target_arch = "wasm32", feature = "webgpu"))]
+                let pipeline = device
+                    .create_render_pipeline_async(&descriptor)
+                    .await
+                    .map_err(PipelineCacheError::CreateRenderPipeline)?;
+                #[cfg(not(all(target_arch = "wasm32", feature = "webgpu")))]
+                let pipeline = device.create_render_pipeline(&descriptor);
+                Ok(Pipeline::RenderPipeline(pipeline))
             },
             self.synchronous_pipeline_compilation,
         )
@@ -710,7 +726,29 @@ impl PipelineCache {
             }
         }
 
+        #[cfg(all(target_arch = "wasm32", feature = "webgpu"))]
+        let waiting_pipelines = {
+            let mut pending: Vec<_> = waiting_pipelines.into_iter().collect();
+            // Poll the active promise first, then start queued entries in insertion order.
+            pending.sort_unstable_by_key(|id| {
+                (
+                    !matches!(pipelines[*id].state, CachedPipelineState::Creating(_)),
+                    *id,
+                )
+            });
+            pending
+        };
         for id in waiting_pipelines {
+            // Keep complex WebGPU compilations from running concurrently in the driver.
+            #[cfg(all(target_arch = "wasm32", feature = "webgpu"))]
+            if matches!(pipelines[id].state, CachedPipelineState::Queued)
+                && pipelines
+                    .iter()
+                    .any(|pipeline| matches!(pipeline.state, CachedPipelineState::Creating(_)))
+            {
+                self.waiting_pipelines.insert(id);
+                continue;
+            }
             self.process_pipeline(&mut pipelines[id], id);
         }
 
@@ -756,6 +794,10 @@ impl PipelineCache {
                         error!("{}", pipeline_error_context(cached_pipeline));
                     }
                     error!("failed to process shader error:\n{}", error_detail);
+                    return;
+                }
+                PipelineCacheError::CreateRenderPipeline(description) => {
+                    error!("failed to create render pipeline: {}", description);
                     return;
                 }
                 PipelineCacheError::CreateShaderModule(description) => {
@@ -866,10 +908,13 @@ fn create_pipeline_task(
     }
 }
 
-#[cfg(any(
-    target_arch = "wasm32",
-    target_os = "macos",
-    not(feature = "multi_threaded")
+#[cfg(all(
+    not(all(target_arch = "wasm32", feature = "webgpu")),
+    any(
+        target_arch = "wasm32",
+        target_os = "macos",
+        not(feature = "multi_threaded")
+    )
 ))]
 fn create_pipeline_task(
     task: impl Future<Output = Result<Pipeline, PipelineCacheError>> + Send + 'static,
@@ -879,4 +924,14 @@ fn create_pipeline_task(
         Ok(pipeline) => CachedPipelineState::Ok(pipeline),
         Err(err) => CachedPipelineState::Err(err),
     }
+}
+
+// A JavaScript compilation promise needs the browser event loop to run. Blocking on it
+// prevents completion. Keep the cache entry pending until the task finishes.
+#[cfg(all(target_arch = "wasm32", feature = "webgpu"))]
+fn create_pipeline_task(
+    task: impl Future<Output = Result<Pipeline, PipelineCacheError>> + 'static,
+    _sync: bool,
+) -> CachedPipelineState {
+    CachedPipelineState::Creating(bevy_tasks::AsyncComputeTaskPool::get().spawn_local(task))
 }

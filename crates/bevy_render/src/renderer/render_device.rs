@@ -190,6 +190,18 @@ impl RenderDevice {
         RenderPipeline::from(wgpu_render_pipeline)
     }
 
+    /// Compiles a WebGPU render pipeline on the browser's asynchronous compiler.
+    #[cfg(all(target_arch = "wasm32", feature = "webgpu"))]
+    pub async fn create_render_pipeline_async(
+        &self,
+        desc: &RawRenderPipelineDescriptor<'_>,
+    ) -> Result<RenderPipeline, String> {
+        self.device
+            .create_render_pipeline_async(desc)
+            .await
+            .map(RenderPipeline::from)
+    }
+
     /// Creates a [`ComputePipeline`].
     #[inline]
     pub fn create_compute_pipeline(

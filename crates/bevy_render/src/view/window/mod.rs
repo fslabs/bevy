@@ -251,7 +251,13 @@ pub fn prepare_windows(
         };
 
         // We didn't present the previous frame, so we can keep using our existing swapchain texture.
-        if window.has_swapchain_texture() && !window.size_changed && !window.present_mode_changed {
+        // WebGPU expires canvas textures between display frames, including frames where
+        // an unfinished pipeline prevented a pass from writing to the window.
+        if !cfg!(target_arch = "wasm32")
+            && window.has_swapchain_texture()
+            && !window.size_changed
+            && !window.present_mode_changed
+        {
             continue;
         }
 
